@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildSnapshotUrl,
-  getSnapshotForGroup,
+  getLayoutWidth,
+  getSnapshotForViewport,
   getSnapshotFrame,
   getSnapshotFrameHeight,
-  pickRepresentativeViewport,
+  getViewportOptions,
+  getViewportPoints,
 } from './heatmap-preview';
 
 const snapshot = {
@@ -17,34 +19,64 @@ const snapshot = {
   viewportH: 1080,
 };
 
-describe('pickRepresentativeViewport', () => {
-  it('returns null without usable metrics', () => {
-    expect(pickRepresentativeViewport([])).toBeNull();
+const point = {
+  x: 10,
+  y: 20,
+  pageX: 10.4,
+  pageY: 520.2,
+  pageW: 1512,
+  pageH: 4000,
+  viewportW: 1512,
+  viewportH: 900,
+  count: 1,
+};
+
+describe('getViewportOptions', () => {
+  it('returns an empty list without usable metrics', () => {
+    expect(getViewportOptions([])).toEqual([]);
     expect(
-      pickRepresentativeViewport([{ viewportW: 0, viewportH: 0, pageW: 1, pageH: 1, count: 3 }]),
-    ).toBeNull();
+      getViewportOptions([{ viewportW: 0, viewportH: 0, pageW: 1, pageH: 1, count: 3 }]),
+    ).toEqual([]);
   });
 
-  it('picks the viewport with most weight and the largest page size of that viewport', () => {
-    const result = pickRepresentativeViewport([
-      { viewportW: 2764, viewportH: 1200, pageW: 2749, pageH: 9000, count: 2 },
-      { viewportW: 2560, viewportH: 1300, pageW: 2545, pageH: 7000, count: 3 },
-      { viewportW: 2764, viewportH: 1200, pageW: 2749, pageH: 9500, count: 2 },
+  it('lists real windows by count, keeping width and height apart', () => {
+    const options = getViewportOptions([
+      { viewportW: 1512, viewportH: 900, pageW: 1497, pageH: 4000, count: 2 },
+      { viewportW: 1512, viewportH: 800, pageW: 1497, pageH: 4100, count: 1 },
+      { viewportW: 2764, viewportH: 1331, pageW: 2749, pageH: 9000, count: 5 },
+      { viewportW: 1512, viewportH: 900, pageW: 1497, pageH: 4200, count: 2 },
     ]);
 
-    expect(result).toEqual({ viewportW: 2764, viewportH: 1200, pageW: 2749, pageH: 9500 });
+    expect(options.map(option => [option.key, option.count])).toEqual([
+      ['2764x1331', 5],
+      ['1512x900', 4],
+      ['1512x800', 1],
+    ]);
+    expect(options[1].pageH).toBe(4200);
   });
 });
 
-describe('getSnapshotForGroup', () => {
-  it('falls back to the server snapshot when the group has no data', () => {
-    expect(getSnapshotForGroup(snapshot, [])).toBe(snapshot);
-  });
+describe('getViewportPoints', () => {
+  it('keeps only the points of the exact window and merges equal positions', () => {
+    const result = getViewportPoints(
+      [point, { ...point, count: 2 }, { ...point, viewportH: 800 }, { ...point, viewportW: 1920 }],
+      { viewportW: 1512, viewportH: 900 },
+    );
 
-  it('replaces the viewport with the group one and keeps the url', () => {
-    const result = getSnapshotForGroup(snapshot, [
-      { viewportW: 414, viewportH: 800, pageW: 414, pageH: 4000, count: 5 },
-    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ pageX: 10, pageY: 520, count: 3, viewportW: 1512 });
+  });
+});
+
+describe('getSnapshotForViewport', () => {
+  it('applies the window to the snapshot and keeps the url', () => {
+    const result = getSnapshotForViewport(snapshot, {
+      viewportW: 414,
+      viewportH: 800,
+      pageW: 414,
+      pageH: 4000,
+      count: 5,
+    });
 
     expect(result).toMatchObject({
       url: snapshot.url,
@@ -64,6 +96,14 @@ describe('getSnapshotFrameHeight', () => {
   });
 });
 
+describe('getLayoutWidth', () => {
+  it('uses the page width unless missing or larger than the viewport', () => {
+    expect(getLayoutWidth({ pageW: 2749, viewportW: 2764 })).toBe(2749);
+    expect(getLayoutWidth({ pageW: 0, viewportW: 1920 })).toBe(1920);
+    expect(getLayoutWidth({ pageW: 2500, viewportW: 1920 })).toBe(1920);
+  });
+});
+
 describe('buildSnapshotUrl', () => {
   it('appends the viewport fragment', () => {
     expect(buildSnapshotUrl('https://example.com/a?x=1', 414, 800)).toBe(
@@ -79,28 +119,23 @@ describe('buildSnapshotUrl', () => {
 });
 
 describe('getSnapshotFrame', () => {
-  it('lays out at the visitor width and scales to the target width', () => {
-    const frame = getSnapshotFrame(
-      { ...snapshot, viewportW: 2764, viewportH: 1200, pageW: 2749, pageH: 10000 },
-      1920,
-    );
+  it('renders at the visitor layout size without scaling', () => {
+    const frame = getSnapshotFrame({
+      ...snapshot,
+      viewportW: 2764,
+      viewportH: 1331,
+      pageW: 2749,
+      pageH: 10000,
+    });
 
-    expect(frame.width).toBe(2749);
-    expect(frame.height).toBe(10000);
-    expect(frame.scale).toBeCloseTo(1920 / 2764);
-    expect(frame.scaledHeight).toBeCloseTo((10000 * 1920) / 2764);
-    expect(frame.url).toBe('https://example.com/page#umami-viewport=2764x1200');
-  });
-
-  it('uses the viewport width when the page width is missing or larger', () => {
-    expect(getSnapshotFrame({ ...snapshot, pageW: 0 }, 1920).width).toBe(1920);
-    expect(getSnapshotFrame({ ...snapshot, pageW: 2500 }, 1920).width).toBe(1920);
+    expect(frame).toEqual({
+      url: 'https://example.com/page#umami-viewport=2764x1331',
+      width: 2749,
+      height: 10000,
+    });
   });
 
   it('keeps a single screen page at the viewport height', () => {
-    const frame = getSnapshotFrame({ ...snapshot, pageH: 1100 }, 1920);
-
-    expect(frame.height).toBe(1080);
-    expect(frame.scale).toBe(1);
+    expect(getSnapshotFrame({ ...snapshot, pageH: 1100 }).height).toBe(1080);
   });
 });

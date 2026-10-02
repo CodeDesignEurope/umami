@@ -1,8 +1,8 @@
-import type { HeatmapSnapshot } from '@/queries/sql';
+import type { HeatmapPoint, HeatmapSnapshot } from '@/queries/sql';
 
 export const SNAPSHOT_VIEWPORT_HASH_KEY = 'umami-viewport';
 
-export interface PreviewViewportMetric {
+export interface ViewportMetric {
   viewportW: number;
   viewportH: number;
   pageW: number;
@@ -10,75 +10,102 @@ export interface PreviewViewportMetric {
   count: number;
 }
 
+export interface ViewportOption extends ViewportMetric {
+  key: string;
+}
+
 export interface SnapshotFrame {
   url: string;
   width: number;
   height: number;
-  scale: number;
-  scaledHeight: number;
+}
+
+export function getViewportKey(viewportW: number, viewportH: number) {
+  return `${viewportW}x${viewportH}`;
 }
 
 /**
- * Picks the most common viewport (by weight) among the metrics of one screen width group.
- * Page size is the largest one recorded for that viewport.
+ * Lists the real browser windows (width x height) found in the metrics, most used first.
+ * Page size is the largest one recorded for that window.
  */
-export function pickRepresentativeViewport(
-  metrics: PreviewViewportMetric[],
-): Omit<PreviewViewportMetric, 'count'> | null {
-  const viewports = new Map<string, PreviewViewportMetric>();
+export function getViewportOptions(metrics: ViewportMetric[]): ViewportOption[] {
+  const options = new Map<string, ViewportOption>();
 
   for (const metric of metrics) {
     if (!(metric.viewportW > 0) || !(metric.viewportH > 0)) {
       continue;
     }
 
-    const key = `${metric.viewportW}x${metric.viewportH}`;
-    const existing = viewports.get(key);
+    const key = getViewportKey(metric.viewportW, metric.viewportH);
+    const existing = options.get(key);
 
     if (existing) {
       existing.count += metric.count;
       existing.pageW = Math.max(existing.pageW, metric.pageW);
       existing.pageH = Math.max(existing.pageH, metric.pageH);
     } else {
-      viewports.set(key, { ...metric });
+      options.set(key, { ...metric, key });
     }
   }
 
-  let best: PreviewViewportMetric | null = null;
-
-  for (const viewport of viewports.values()) {
-    if (!best || viewport.count > best.count) {
-      best = viewport;
-    }
-  }
-
-  if (!best) {
-    return null;
-  }
-
-  const { viewportW, viewportH, pageW, pageH } = best;
-
-  return { viewportW, viewportH, pageW, pageH };
+  return Array.from(options.values()).sort(
+    (a, b) => b.count - a.count || b.viewportW - a.viewportW || b.viewportH - a.viewportH,
+  );
 }
 
 /**
- * Returns the snapshot to preview for a screen width group, using the viewport most
- * recorded in that group. Falls back to the snapshot chosen by the server.
+ * Keeps the clicks recorded in the given window, merging the ones on the same page position.
  */
-export function getSnapshotForGroup(
-  snapshot: HeatmapSnapshot,
-  groupMetrics: PreviewViewportMetric[],
-): HeatmapSnapshot {
-  const viewport = pickRepresentativeViewport(groupMetrics);
+export function getViewportPoints(
+  points: HeatmapPoint[],
+  viewport: Pick<ViewportMetric, 'viewportW' | 'viewportH'>,
+) {
+  const grouped = new Map<string, HeatmapPoint>();
 
-  if (!viewport) {
-    return snapshot;
+  for (const point of points) {
+    if (point.viewportW !== viewport.viewportW || point.viewportH !== viewport.viewportH) {
+      continue;
+    }
+
+    const pageX = Math.round(point.pageX);
+    const pageY = Math.round(point.pageY);
+    const key = `${pageX}:${pageY}`;
+    const existing = grouped.get(key);
+
+    if (existing) {
+      existing.count += point.count;
+      existing.pageW = Math.max(existing.pageW, point.pageW);
+      existing.pageH = Math.max(existing.pageH, point.pageH);
+    } else {
+      grouped.set(key, {
+        ...point,
+        x: Math.round(point.x),
+        y: Math.round(point.y),
+        pageX,
+        pageY,
+      });
+    }
   }
+
+  return Array.from(grouped.values());
+}
+
+/**
+ * Returns the snapshot as seen by the selected window, keeping the url chosen by the server.
+ */
+export function getSnapshotForViewport(
+  snapshot: HeatmapSnapshot,
+  viewport: ViewportMetric,
+): HeatmapSnapshot {
+  const { viewportW, viewportH, pageW, pageH } = viewport;
 
   return {
     ...snapshot,
-    id: `${snapshot.id}:${viewport.viewportW}x${viewport.viewportH}`,
-    ...viewport,
+    id: `${snapshot.id}:${getViewportKey(viewportW, viewportH)}`,
+    viewportW,
+    viewportH,
+    pageW,
+    pageH,
   };
 }
 
@@ -95,6 +122,13 @@ export function getSnapshotFrameHeight({
 }
 
 /**
+ * `pageW` excludes the scrollbar, so it is the real layout width when available.
+ */
+export function getLayoutWidth({ pageW, viewportW }: Pick<ViewportMetric, 'pageW' | 'viewportW'>) {
+  return Math.max(1, pageW > 0 && pageW <= viewportW ? pageW : viewportW);
+}
+
+/**
  * The preview page can read the visitor's window size from the URL fragment
  * (`#umami-viewport=<width>x<height>`, CSS pixels) to rebuild viewport based layouts.
  */
@@ -105,21 +139,13 @@ export function buildSnapshotUrl(url: string, viewportW: number, viewportH: numb
 }
 
 /**
- * Describes the preview frame: rendered at the visitor's real layout size, then scaled
- * with the same factor used to normalize points to the selected screen width.
+ * Describes the preview frame, rendered at the visitor's real layout size (scale 1,
+ * the same pixels as the recorded coordinates).
  */
-export function getSnapshotFrame(snapshot: HeatmapSnapshot, targetWidth: number): SnapshotFrame {
-  const viewportW = Math.max(1, snapshot.viewportW);
-  // `pageW` excludes the scrollbar, so it is the real layout width when available.
-  const width = snapshot.pageW > 0 && snapshot.pageW <= viewportW ? snapshot.pageW : viewportW;
-  const height = Math.max(1, getSnapshotFrameHeight(snapshot));
-  const scale = targetWidth / viewportW;
-
+export function getSnapshotFrame(snapshot: HeatmapSnapshot): SnapshotFrame {
   return {
-    url: buildSnapshotUrl(snapshot.url, viewportW, snapshot.viewportH),
-    width,
-    height,
-    scale,
-    scaledHeight: height * scale,
+    url: buildSnapshotUrl(snapshot.url, snapshot.viewportW, snapshot.viewportH),
+    width: getLayoutWidth(snapshot),
+    height: Math.max(1, getSnapshotFrameHeight(snapshot)),
   };
 }
