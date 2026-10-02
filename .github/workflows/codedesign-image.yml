@@ -1,0 +1,62 @@
+name: CodeDesign image
+
+on:
+  push:
+    tags:
+      - "cd-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version (e.g. 3.4.0-heatmap.1, or the tag cd-v3.4.0-heatmap.1)"
+        required: true
+
+jobs:
+  build:
+    name: Build and push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute image tag
+        id: compute
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="$REF_NAME"
+          fi
+
+          VERSION="${VERSION#cd-v}"
+          VERSION="${VERSION#v}"
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Computed image: $IMAGE"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.compute.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
